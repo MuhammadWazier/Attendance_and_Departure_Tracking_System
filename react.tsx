@@ -4,6 +4,62 @@ import * as XLSX from 'xlsx';
 import syrianEagleLogo from './SyrianEagleLogo.png';
 
 const BACKUP_FORMAT = 'xface-attendance-backup';
+const DATABASE_NAME = 'xface-attendance-database';
+const DATABASE_VERSION = 1;
+const DATA_STORE_NAME = 'application-data';
+const APP_DATA_KEY = 'current';
+let databasePromise;
+
+const openAppDatabase = () => {
+  if (!('indexedDB' in window)) {
+    return Promise.reject(new Error('هذا المتصفح لا يدعم قاعدة البيانات المحلية IndexedDB.'));
+  }
+  if (!databasePromise) {
+    databasePromise = new Promise((resolve, reject) => {
+      const request = window.indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+      request.onupgradeneeded = () => {
+        if (!request.result.objectStoreNames.contains(DATA_STORE_NAME)) {
+          request.result.createObjectStore(DATA_STORE_NAME, { keyPath: 'key' });
+        }
+      };
+      request.onsuccess = () => {
+        request.result.onversionchange = () => {
+          request.result.close();
+          databasePromise = undefined;
+        };
+        resolve(request.result);
+      };
+      request.onerror = () => reject(request.error || new Error('تعذر فتح قاعدة البيانات المحلية.'));
+      request.onblocked = () => reject(new Error('قاعدة البيانات المحلية مشغولة في نافذة أخرى.'));
+    }).catch(error => {
+      databasePromise = undefined;
+      throw error;
+    });
+  }
+  return databasePromise;
+};
+
+const readStoredAppData = async () => {
+  const database = await openAppDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(DATA_STORE_NAME, 'readonly');
+    const request = transaction.objectStore(DATA_STORE_NAME).get(APP_DATA_KEY);
+    request.onsuccess = () => resolve(request.result?.data);
+    request.onerror = () => reject(request.error || new Error('تعذر قراءة البيانات المحلية.'));
+    transaction.onabort = () => reject(transaction.error || new Error('تعذرت قراءة البيانات المحلية.'));
+  });
+};
+
+const writeStoredAppData = async data => {
+  const database = await openAppDatabase();
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(DATA_STORE_NAME, 'readwrite');
+    transaction.objectStore(DATA_STORE_NAME).put({ key: APP_DATA_KEY, data });
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error('تعذر حفظ البيانات المحلية.'));
+    transaction.onabort = () => reject(transaction.error || new Error('أُلغيت عملية حفظ البيانات المحلية.'));
+  });
+};
 
 const createEmptyAppData = () => ({
   settings: {
@@ -28,6 +84,7 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [selectedDirectoryEmployeeId, setSelectedDirectoryEmployeeId] = useState('');
   const [toast, setToast] = useState({ show: false, message: '', type: 'success' });
+  const [isDataReady, setIsDataReady] = useState(false);
   
   const [appData, setAppData] = useState({
     settings: {
@@ -104,48 +161,55 @@ export default function App() {
   const backupFileInputRef = useRef(null);
 
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem('xface_react_app_data');
-      if (saved) {
-        const parsed = JSON.parse(saved);
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          throw new Error('بيانات التخزين المحلي غير صالحة');
+    let cancelled = false;
+    const initializeDatabase = async () => {
+      try {
+        const storedData = await readStoredAppData();
+        if (storedData) {
+          const normalizedData = normalizeAppData(storedData);
+          if (!cancelled) {
+            setAppData(normalizedData);
+            setSettingsForm(normalizedData.settings);
+          }
+          return;
         }
-        parsed.settings = {
-          ...appData.settings,
-          ...(parsed.settings || {}),
-          workDays: Array.isArray(parsed.settings?.workDays) ? parsed.settings.workDays : appData.settings.workDays,
-          holidays: Array.isArray(parsed.settings?.holidays) ? parsed.settings.holidays : []
-        };
-        parsed.attendance = (Array.isArray(parsed.attendance) ? parsed.attendance : [])
-          .filter(rec => rec && typeof rec === 'object')
-          .map(rec => ({
-            ...rec,
-            directorate: rec.directorate || rec.department || 'عامة',
-            department: rec.directorate ? (rec.department || '') : '',
-            day: getArabicDay(rec.date) || rec.day
-          }));
-        parsed.leaves = Array.isArray(parsed.leaves) ? parsed.leaves : [];
-        parsed.employeesStatus = Object.fromEntries(
-          Object.entries(parsed.employeesStatus && typeof parsed.employeesStatus === 'object' ? parsed.employeesStatus : {}).map(([empId, status]) => [
-            empId,
-            status && typeof status === 'object' && status.directorate
-              ? { ...status, department: status.department || '' }
-              : { ...(status && typeof status === 'object' ? status : {}), directorate: status?.department || '', department: '' }
-          ])
-        );
-        setAppData(parsed);
-        setSettingsForm(parsed.settings);
-      } else {
-        loadDemoData(false);
+
+        const legacyData = localStorage.getItem('xface_react_app_data');
+        if (legacyData) {
+          const migratedData = normalizeAppData(JSON.parse(legacyData));
+          await writeStoredAppData(migratedData);
+          localStorage.removeItem('xface_react_app_data');
+          if (!cancelled) {
+            setAppData(migratedData);
+            setSettingsForm(migratedData.settings);
+            showToastMsg('تم نقل بياناتك المحفوظة إلى قاعدة البيانات المحلية الجديدة.');
+          }
+        } else {
+          await loadDemoData(false);
+        }
+      } catch (error) {
+        console.error(error);
+        if (!cancelled) {
+          try {
+            const legacyData = localStorage.getItem('xface_react_app_data');
+            if (legacyData) {
+              const fallbackData = normalizeAppData(JSON.parse(legacyData));
+              setAppData(fallbackData);
+              setSettingsForm(fallbackData.settings);
+            }
+          } catch (fallbackError) {
+            console.error(fallbackError);
+          }
+          showToastMsg('تعذر الوصول إلى قاعدة البيانات المحلية. تحقق من إعدادات المتصفح؛ قد لا تُحفظ التعديلات.', 'error');
+        }
+      } finally {
+        if (!cancelled) setIsDataReady(true);
       }
-    } catch (e) {
-      console.error(e);
-      loadDemoData(false);
-      showToastMsg("تمت استعادة البيانات التجريبية بعد اكتشاف بيانات محفوظة غير صالحة.", "warning");
-    }
+    };
+    initializeDatabase();
 
     return () => {
+      cancelled = true;
       if (toastTimeout.current) clearTimeout(toastTimeout.current);
       pieInstance.current?.destroy();
       barInstance.current?.destroy();
@@ -158,13 +222,46 @@ export default function App() {
     }
   }, [activeTab]);
 
-  const saveToLocalStorage = (newData) => {
+  const normalizeAppData = data => {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      throw new Error('بيانات قاعدة البيانات المحلية غير صالحة.');
+    }
+    const normalizedData = {
+      ...data,
+      settings: {
+        ...appData.settings,
+        ...(data.settings || {}),
+        workDays: Array.isArray(data.settings?.workDays) ? data.settings.workDays : appData.settings.workDays,
+        holidays: Array.isArray(data.settings?.holidays) ? data.settings.holidays : []
+      },
+      attendance: (Array.isArray(data.attendance) ? data.attendance : [])
+        .filter(rec => rec && typeof rec === 'object')
+        .map(rec => ({
+          ...rec,
+          directorate: rec.directorate || rec.department || 'عامة',
+          department: rec.directorate ? (rec.department || '') : '',
+          day: getArabicDay(rec.date) || rec.day
+        })),
+      leaves: Array.isArray(data.leaves) ? data.leaves : [],
+      employeesStatus: Object.fromEntries(
+        Object.entries(data.employeesStatus && typeof data.employeesStatus === 'object' ? data.employeesStatus : {}).map(([empId, status]) => [
+          empId,
+          status && typeof status === 'object' && status.directorate
+            ? { ...status, department: status.department || '' }
+            : { ...(status && typeof status === 'object' ? status : {}), directorate: status?.department || '', department: '' }
+        ])
+      )
+    };
+    return normalizedData;
+  };
+
+  const saveToDatabase = async newData => {
     try {
-      localStorage.setItem('xface_react_app_data', JSON.stringify(newData));
+      await writeStoredAppData(newData);
       return true;
     } catch (e) {
       console.error(e);
-      showToastMsg("تعذر حفظ التغييرات محلياً. تحقق من مساحة التخزين في المتصفح.", "error");
+      showToastMsg("تعذر حفظ التغييرات في قاعدة البيانات المحلية. تحقق من إعدادات المتصفح ومساحة التخزين.", "error");
       return false;
     }
   };
@@ -227,7 +324,7 @@ export default function App() {
       if (backup?.format !== BACKUP_FORMAT || backup.version !== 1 || !validData) {
         throw new Error('ملف النسخة الاحتياطية غير صالح أو غير مدعوم.');
       }
-      if (!saveToLocalStorage(data)) return;
+      if (!await saveToDatabase(data)) return;
 
       setAppData(data);
       setSettingsForm(data.settings);
@@ -240,12 +337,12 @@ export default function App() {
     }
   };
 
-  const deleteAllData = () => {
+  const deleteAllData = async () => {
     const confirmed = window.confirm('هل أنت متأكد من حذف جميع بيانات الحضور والإجازات والموظفين والعطل؟ لا يمكن التراجع عن هذه العملية. يُنصح بإنشاء نسخة احتياطية قبل المتابعة.');
     if (!confirmed) return;
 
     const emptyData = createEmptyAppData();
-    if (!saveToLocalStorage(emptyData)) return;
+    if (!await saveToDatabase(emptyData)) return;
 
     setAppData(emptyData);
     setSettingsForm(emptyData.settings);
@@ -266,7 +363,7 @@ export default function App() {
     }, 3500);
   };
 
-  const loadDemoData = (notify = true) => {
+  const loadDemoData = async (notify = true) => {
     const demo = {
       settings: {
         startTime: "08:00",
@@ -334,7 +431,8 @@ export default function App() {
         }
       ])
     );
-    const saved = saveToLocalStorage(demo);
+    const saved = await saveToDatabase(demo);
+    if (!saved) return;
     setAppData(demo);
     setSettingsForm(demo.settings);
     if (notify && saved) showToastMsg("تم تحميل البيانات التجريبية بنجاح");
@@ -757,7 +855,7 @@ export default function App() {
     input.value = '';
   };
 
-  const processAndSaveUploadedData = () => {
+  const processAndSaveUploadedData = async () => {
     if (tempUploadedAttendance.length === 0) return;
     const updatedAttendance = [...appData.attendance, ...tempUploadedAttendance];
     const updatedStatus = { ...appData.employeesStatus };
@@ -775,7 +873,7 @@ export default function App() {
     });
 
     const newAppData = { ...appData, attendance: updatedAttendance, employeesStatus: updatedStatus };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     setTempUploadedAttendance([]);
     showToastMsg("تم اعتماد وحفظ بيانات الحضور بنجاح");
@@ -819,7 +917,7 @@ export default function App() {
     setActiveLeaveEmployeeSuggestion(-1);
   };
 
-  const saveLeaveRecord = (e) => {
+  const saveLeaveRecord = async (e) => {
     e.preventDefault();
     if (!leaveForm.empId) {
       showToastMsg("الرجاء اختيار موظف صحيح من القائمة", "error");
@@ -867,7 +965,7 @@ export default function App() {
       documentNumber: leaveForm.documentNumber.trim()
     };
     const newAppData = { ...appData, leaves: [...appData.leaves, newLeave] };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     setLeaveForm({ empName: '', empId: '', type: 'سنوية', leaveUnit: 'أيام', fromDate: '', toDate: '', fromTime: '', toTime: '', documentNumber: '', status: 'معتمدة', notes: '' });
     setLeaveEmployeeSearch('');
@@ -875,14 +973,14 @@ export default function App() {
     showToastMsg("تم حفظ الإجازة بنجاح");
   };
 
-  const deleteLeaveRecord = (id) => {
+  const deleteLeaveRecord = async (id) => {
     const newAppData = { ...appData, leaves: appData.leaves.filter(l => l.id !== id) };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     showToastMsg("تم حذف الإجازة بنجاح");
   };
 
-  const saveEmployeeStatusModal = (e) => {
+  const saveEmployeeStatusModal = async (e) => {
     e.preventDefault();
     const updatedStatus = {
       ...appData.employeesStatus,
@@ -895,13 +993,13 @@ export default function App() {
       }
     };
     const newAppData = { ...appData, employeesStatus: updatedStatus };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     setEmpModal({ isOpen: false, empId: '', status: 'نشط', date: '', directorate: '', department: '' });
     showToastMsg("تم تحديث بيانات الموظف بنجاح");
   };
 
-  const saveSettings = (e) => {
+  const saveSettings = async (e) => {
     e.preventDefault();
     const graceLate = Number(settingsForm.graceLate);
     const graceEarly = Number(settingsForm.graceEarly);
@@ -927,12 +1025,12 @@ export default function App() {
       workDays: [...new Set(settingsForm.workDays)].filter(day => ["الأحد", "الإثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت"].includes(day))
     };
     const newAppData = { ...appData, settings: newSettings };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     showToastMsg("تم حفظ إعدادات الدوام بنجاح");
   };
 
-  const addHolidayRecord = (e) => {
+  const addHolidayRecord = async (e) => {
     e.preventDefault();
     if (!holidayForm.title.trim() || !holidayForm.fromDate || !holidayForm.toDate || holidayForm.toDate < holidayForm.fromDate) {
       showToastMsg("تحقق من اسم العطلة وتاريخَي البداية والنهاية", "error");
@@ -945,16 +1043,16 @@ export default function App() {
     };
     const holidays = [...(appData.settings.holidays || []), newHoliday];
     const newAppData = { ...appData, settings: { ...appData.settings, holidays } };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     setHolidayForm({ title: '', fromDate: '', toDate: '' });
     showToastMsg("تم إضافة العطلة الرسمية بنجاح");
   };
 
-  const deleteHolidayRecord = (id) => {
+  const deleteHolidayRecord = async (id) => {
     const holidays = (appData.settings.holidays || []).filter(h => h.id !== id);
     const newAppData = { ...appData, settings: { ...appData.settings, holidays } };
-    if (!saveToLocalStorage(newAppData)) return;
+    if (!await saveToDatabase(newAppData)) return;
     setAppData(newAppData);
     showToastMsg("تم حذف العطلة بنجاح");
   };
@@ -1122,6 +1220,17 @@ export default function App() {
       showToastMsg("تعذر إنشاء ملف التقرير", "error");
     }
   };
+
+  if (!isDataReady) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#edebe0] text-[#002623]" dir="rtl" role="status" aria-live="polite">
+        <div className="flex items-center gap-3 rounded-2xl bg-white px-6 py-5 shadow-sm border border-[#b9a779]/50">
+          <i className="fa-solid fa-database text-[#054239]" aria-hidden="true"></i>
+          <span className="text-sm font-semibold">جارٍ تحميل البيانات المحلية...</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="bg-[#edebe0]/50 text-[#3d3a3b] antialiased min-h-screen flex flex-col font-sans" dir="rtl">
@@ -2070,7 +2179,7 @@ export default function App() {
                       إدارة البيانات والنسخ الاحتياطي
                     </h4>
                     <p className="text-xs text-[#3d3a3b]/70 mt-1">
-                      البيانات محفوظة محلياً في هذا المتصفح. أنشئ ملف JSON لحفظ نسخة على جهازك، أو استعد البيانات من نسخة سابقة.
+                      تُحفظ البيانات في قاعدة IndexedDB داخل هذا المتصفح وعلى هذا الجهاز. أنشئ ملف JSON لحفظ نسخة احتياطية أو استعد بيانات من نسخة سابقة.
                     </p>
                   </div>
                   <input
