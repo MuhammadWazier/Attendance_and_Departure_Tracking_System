@@ -3,6 +3,24 @@ import Chart from 'chart.js/auto';
 import * as XLSX from 'xlsx';
 import syrianEagleLogo from './SyrianEagleLogo.png';
 
+const BACKUP_FORMAT = 'xface-attendance-backup';
+
+const createEmptyAppData = () => ({
+  settings: {
+    startTime: '08:00',
+    endTime: '16:00',
+    graceLate: 15,
+    graceEarly: 15,
+    workDays: ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'],
+    holidays: []
+  },
+  attendance: [],
+  leaves: [],
+  employeesStatus: {}
+});
+
+const isObjectRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+
 export default function App() {
   // Main Application State
   const [activeTab, setActiveTab] = useState('dashboard');
@@ -83,6 +101,7 @@ export default function App() {
   const pieInstance = useRef(null);
   const barInstance = useRef(null);
   const toastTimeout = useRef(null);
+  const backupFileInputRef = useRef(null);
 
   useEffect(() => {
     try {
@@ -148,6 +167,95 @@ export default function App() {
       showToastMsg("تعذر حفظ التغييرات محلياً. تحقق من مساحة التخزين في المتصفح.", "error");
       return false;
     }
+  };
+
+  const createBackup = () => {
+    try {
+      const backup = {
+        format: BACKUP_FORMAT,
+        version: 1,
+        exportedAt: new Date().toISOString(),
+        data: appData
+      };
+      const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `xface-attendance-backup-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+      showToastMsg('تم إنشاء ملف النسخة الاحتياطية بنجاح');
+    } catch (error) {
+      console.error(error);
+      showToastMsg('تعذر إنشاء النسخة الاحتياطية.', 'error');
+    }
+  };
+
+  const importBackup = async (event) => {
+    const input = event.target;
+    const file = input.files?.[0];
+    if (!file) return;
+    input.value = '';
+
+    try {
+      const backup = JSON.parse(await file.text());
+      const data = backup?.data;
+      const validSettings = isObjectRecord(data?.settings) &&
+        typeof data.settings.startTime === 'string' &&
+        typeof data.settings.endTime === 'string' &&
+        Number.isFinite(data.settings.graceLate) &&
+        Number.isFinite(data.settings.graceEarly) &&
+        Array.isArray(data.settings.workDays) &&
+        data.settings.workDays.every(day => typeof day === 'string') &&
+        Array.isArray(data.settings.holidays) &&
+        data.settings.holidays.every(holiday =>
+          isObjectRecord(holiday) &&
+          typeof holiday.id === 'string' &&
+          typeof holiday.title === 'string' &&
+          typeof holiday.fromDate === 'string' &&
+          typeof holiday.toDate === 'string'
+        );
+      const validData = isObjectRecord(data) &&
+        validSettings &&
+        Array.isArray(data.attendance) &&
+        data.attendance.every(isObjectRecord) &&
+        Array.isArray(data.leaves) &&
+        data.leaves.every(isObjectRecord) &&
+        isObjectRecord(data.employeesStatus) &&
+        Object.values(data.employeesStatus).every(isObjectRecord);
+
+      if (backup?.format !== BACKUP_FORMAT || backup.version !== 1 || !validData) {
+        throw new Error('ملف النسخة الاحتياطية غير صالح أو غير مدعوم.');
+      }
+      if (!saveToLocalStorage(data)) return;
+
+      setAppData(data);
+      setSettingsForm(data.settings);
+      setTempUploadedAttendance([]);
+      setSelectedDirectoryEmployeeId('');
+      showToastMsg('تم استيراد النسخة الاحتياطية واستعادة البيانات بنجاح');
+    } catch (error) {
+      console.error(error);
+      showToastMsg(error instanceof Error ? error.message : 'تعذر استيراد النسخة الاحتياطية.', 'error');
+    }
+  };
+
+  const deleteAllData = () => {
+    const confirmed = window.confirm('هل أنت متأكد من حذف جميع بيانات الحضور والإجازات والموظفين والعطل؟ لا يمكن التراجع عن هذه العملية. يُنصح بإنشاء نسخة احتياطية قبل المتابعة.');
+    if (!confirmed) return;
+
+    const emptyData = createEmptyAppData();
+    if (!saveToLocalStorage(emptyData)) return;
+
+    setAppData(emptyData);
+    setSettingsForm(emptyData.settings);
+    setTempUploadedAttendance([]);
+    setSelectedDirectoryEmployeeId('');
+    setLeaveForm({ empName: '', empId: '', type: 'سنوية', leaveUnit: 'أيام', fromDate: '', toDate: '', fromTime: '', toTime: '', documentNumber: '', status: 'معتمدة', notes: '' });
+    setLeaveEmployeeSearch('');
+    setShowLeaveEmployeeSuggestions(false);
+    setEmpModal({ isOpen: false, empId: '', status: 'نشط', date: '', directorate: '', department: '' });
+    showToastMsg('تم حذف جميع البيانات بنجاح', 'warning');
   };
 
   const showToastMsg = (message, type = 'success') => {
@@ -1954,6 +2062,55 @@ export default function App() {
                     </table>
                   </div>
                 </div>
+
+                <section className="space-y-4 border-t border-[#b9a779]/50 pt-6" aria-labelledby="data-management-title">
+                  <div>
+                    <h4 id="data-management-title" className="font-bold text-[#002623] text-sm flex items-center">
+                      <i className="fa-solid fa-database text-[#054239] ml-2" aria-hidden="true"></i>
+                      إدارة البيانات والنسخ الاحتياطي
+                    </h4>
+                    <p className="text-xs text-[#3d3a3b]/70 mt-1">
+                      البيانات محفوظة محلياً في هذا المتصفح. أنشئ ملف JSON لحفظ نسخة على جهازك، أو استعد البيانات من نسخة سابقة.
+                    </p>
+                  </div>
+                  <input
+                    ref={backupFileInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    onChange={importBackup}
+                    className="hidden"
+                    aria-label="اختيار ملف نسخة احتياطية"
+                  />
+                  <div className="flex flex-col sm:flex-row flex-wrap gap-3">
+                    <button
+                      type="button"
+                      onClick={createBackup}
+                      className="min-h-10 px-4 py-2 bg-[#054239] hover:bg-[#002623] text-[#edebe0] text-xs font-bold rounded-xl border border-[#428177] shadow-sm transition-colors"
+                    >
+                      <i className="fa-solid fa-download ml-2" aria-hidden="true"></i>
+                      إنشاء نسخة احتياطية
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => backupFileInputRef.current?.click()}
+                      className="min-h-10 px-4 py-2 bg-white hover:bg-[#edebe0] text-[#054239] text-xs font-bold rounded-xl border border-[#054239] shadow-sm transition-colors"
+                    >
+                      <i className="fa-solid fa-upload ml-2" aria-hidden="true"></i>
+                      استيراد نسخة احتياطية
+                    </button>
+                    <button
+                      type="button"
+                      onClick={deleteAllData}
+                      className="min-h-10 px-4 py-2 bg-[#6b1f2a] hover:bg-[#4a151e] text-white text-xs font-bold rounded-xl border border-[#6b1f2a] shadow-sm transition-colors"
+                    >
+                      <i className="fa-solid fa-trash-can ml-2" aria-hidden="true"></i>
+                      حذف جميع البيانات
+                    </button>
+                  </div>
+                  <p className="text-[11px] text-[#6b1f2a]">
+                    الحذف يمسح السجلات والإعدادات والعطل من هذا المتصفح بعد التأكيد، ولا يمكن التراجع عنه.
+                  </p>
+                </section>
               </div>
             )}
 
